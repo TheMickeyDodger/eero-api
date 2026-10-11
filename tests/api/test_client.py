@@ -26,8 +26,11 @@ from eero.exceptions import (
 )
 
 from .conftest import (
+    INVALID_GUEST_NAMES,
+    INVALID_NETWORK_NAMES,
     INVALID_PASSWORDS,
     PASSWORD_WRITES,
+    VALID_NAMES,
     VALID_PASSWORDS,
     api_success_response,
     create_mock_response,
@@ -1915,6 +1918,110 @@ class TestEeroClientPasswordValidation:
         )
         assert call_args.kwargs["data"] == {"password": password}
         assert "json" not in call_args.kwargs
+
+
+class TestEeroClientNameValidation:
+    """Tests that the facade rejects unintended network and guest names before sending."""
+
+    @pytest.fixture
+    def client(self, mock_session):
+        """A client with a preferred network and a stubbed auth token."""
+        client = EeroClient(session=mock_session)
+        client._preferred_network_id = "network_123"
+        client._api.auth.get_auth_token = AsyncMock(return_value="auth_token")
+        return client
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("name", INVALID_NETWORK_NAMES)
+    async def test_invalid_network_name_sends_no_request(self, client, mock_session, name):
+        """Test a non-string or empty name is rejected before auth and transport."""
+        with pytest.raises(EeroValidationException, match="name.*non-empty string"):
+            await client.set_network_name(name)
+
+        client._api.auth.get_auth_token.assert_not_awaited()
+        mock_session.request.assert_not_called()
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("enabled", [True, False])
+    @pytest.mark.parametrize("name", INVALID_GUEST_NAMES)
+    async def test_invalid_guest_name_sends_no_request(self, client, mock_session, enabled, name):
+        """Test a supplied non-string or empty guest name is rejected before auth and transport."""
+        with pytest.raises(EeroValidationException, match="name.*non-empty string"):
+            await client.set_guest_network(enabled=enabled, name=name)
+
+        client._api.auth.get_auth_token.assert_not_awaited()
+        mock_session.request.assert_not_called()
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "call",
+        [
+            pytest.param(lambda c: c.set_network_name(None), id="network"),
+            pytest.param(lambda c: c.set_guest_network(enabled=True, name=""), id="guest"),
+        ],
+    )
+    async def test_rejected_name_keeps_the_network_cache(self, client, call):
+        """Test a rejected write leaves the cached network snapshot and cache epoch alone.
+
+        Nothing was written, so evicting the snapshot or bumping the epoch (which
+        discards in-flight reads) would only cost a needless re-fetch.
+        """
+        client._cache["network"]["network_123"] = {"data": {}, "timestamp": time.monotonic()}
+        epoch = client._cache_epoch
+
+        with pytest.raises(EeroValidationException):
+            await call(client)
+
+        assert "network_123" in client._cache["network"]
+        assert client._cache_epoch == epoch
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("name", VALID_NAMES)
+    async def test_valid_network_name_is_forwarded_unchanged(self, client, mock_session, name):
+        """Test a string name, even "None" or space-padded, is sent verbatim as form data."""
+        mock_session.request.return_value = create_mock_response(200, api_success_response({}))
+
+        await client.set_network_name(name)
+
+        client._api.auth.get_auth_token.assert_awaited_once()
+        call_args = mock_session.request.call_args
+        assert call_args.args == (
+            "PUT",
+            "https://api-user.e2ro.com/2.2/networks/network_123/settings",
+        )
+        assert call_args.kwargs["data"] == {"name": name}
+        assert "json" not in call_args.kwargs
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("name", VALID_NAMES)
+    async def test_valid_guest_name_is_forwarded_unchanged(self, client, mock_session, name):
+        """Test a string guest name, even "None" or space-padded, is sent verbatim."""
+        mock_session.request.return_value = create_mock_response(200, api_success_response({}))
+
+        await client.set_guest_network(enabled=True, name=name)
+
+        client._api.auth.get_auth_token.assert_awaited_once()
+        call_args = mock_session.request.call_args
+        assert call_args.args == (
+            "PUT",
+            "https://api-user.e2ro.com/2.2/networks/network_123/guestnetwork",
+        )
+        assert call_args.kwargs["data"] == {"enabled": "true", "name": name}
+        assert "json" not in call_args.kwargs
+
+    @pytest.mark.asyncio
+    async def test_guest_name_default_is_left_out(self, client, mock_session):
+        """Test the facade's default name=None, passed through explicitly, omits the field."""
+        mock_session.request.return_value = create_mock_response(200, api_success_response({}))
+
+        await client.set_guest_network(enabled=False)
+
+        call_args = mock_session.request.call_args
+        assert call_args.args == (
+            "PUT",
+            "https://api-user.e2ro.com/2.2/networks/network_123/guestnetwork",
+        )
+        assert call_args.kwargs["data"] == {"enabled": "false"}
 
 
 # ========================== Cache invalidation for new write wrappers ==========================

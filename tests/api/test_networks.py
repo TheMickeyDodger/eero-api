@@ -10,21 +10,29 @@ Tests cover:
 - id/path/URL polymorphism and parent-link preference
 - The uncharacterised-write warning on every unverified write
 - Rejecting non-string and empty Wi-Fi passwords before any request
+- Rejecting non-string and empty network / supplied guest names before any request
 - That no method mutates its ``parent`` argument
 """
 
+import contextlib
 import copy
 import logging
+from typing import Dict, List
 from unittest.mock import AsyncMock, MagicMock
+from urllib.parse import parse_qsl
 
+import aiohttp
 import pytest
 
 from eero.api.networks import NetworksAPI
 from eero.exceptions import EeroAuthenticationException, EeroValidationException
 
 from .conftest import (
+    INVALID_GUEST_NAMES,
+    INVALID_NETWORK_NAMES,
     INVALID_PASSWORDS,
     PASSWORD_WRITES,
+    VALID_NAMES,
     VALID_PASSWORDS,
     api_success_response,
     create_mock_response,
@@ -38,6 +46,14 @@ def networks_api(mock_session):
     auth_api.session = mock_session
     auth_api.get_auth_token = AsyncMock(return_value="auth_token")
     return NetworksAPI(auth_api)
+
+
+def _form_fields_sent(mock_session) -> List[Dict[str, str]]:
+    """Decode each request's ``data=`` mapping as aiohttp would put it on the wire."""
+    return [
+        dict(parse_qsl(aiohttp.FormData(call.kwargs["data"])().decode(), keep_blank_values=True))
+        for call in mock_session.request.call_args_list
+    ]
 
 
 class TestNetworksAPIInit:
@@ -496,4 +512,136 @@ class TestNetworksAPIPasswordValidation:
             f"https://api-user.e2ro.com/2.2/networks/network_123/{suffix}",
         )
         assert call_args.kwargs["data"] == {"password": password}
+        assert "json" not in call_args.kwargs
+
+
+class TestNetworksAPINameValidation:
+    """Tests that unintended network and guest names never reach the form body."""
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("name", INVALID_NETWORK_NAMES)
+    async def test_invalid_network_name_sends_no_request(self, networks_api, mock_session, name):
+        """Test a non-string or empty name is rejected before auth and transport."""
+        with pytest.raises(EeroValidationException, match="name.*non-empty string"):
+            await networks_api.set_network_name("network_123", name)
+
+        networks_api._auth_api.get_auth_token.assert_not_awaited()
+        mock_session.request.assert_not_called()
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("enabled", [True, False])
+    @pytest.mark.parametrize("name", INVALID_GUEST_NAMES)
+    async def test_invalid_guest_name_sends_no_request(
+        self, networks_api, mock_session, enabled, name
+    ):
+        """Test a supplied non-string or empty guest name is rejected before auth and transport."""
+        with pytest.raises(EeroValidationException, match="name.*non-empty string"):
+            await networks_api.set_guest_network("network_123", enabled=enabled, name=name)
+
+        networks_api._auth_api.get_auth_token.assert_not_awaited()
+        mock_session.request.assert_not_called()
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "call",
+        [
+            pytest.param(lambda api: api.set_network_name("network_123", None), id="network-none"),
+            pytest.param(
+                lambda api: api.set_guest_network("network_123", enabled=True, name=False),
+                id="guest-bool",
+            ),
+        ],
+    )
+    async def test_invalid_name_never_reaches_the_wire(self, networks_api, mock_session, call):
+        """Test an invalid name is not form-encoded into a literal SSID.
+
+        aiohttp encodes ``{"name": None}`` as ``name=None`` (and ``False`` as
+        ``name=False``), so an unguarded call renames the network to that text.
+        That the call raises is covered above; this pins what the wire carries.
+        """
+        with contextlib.suppress(EeroValidationException):
+            await call(networks_api)
+
+        assert _form_fields_sent(mock_session) == []
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "call",
+        [
+            pytest.param(
+                lambda api: api.set_network_name("network_123", b"leaked-ssid"), id="network"
+            ),
+            pytest.param(
+                lambda api: api.set_guest_network("network_123", enabled=True, name=b"leaked-ssid"),
+                id="guest",
+            ),
+        ],
+    )
+    async def test_rejection_does_not_echo_the_value(self, networks_api, call):
+        """Test the exception names the field but never repeats the rejected value."""
+        with pytest.raises(EeroValidationException) as excinfo:
+            await call(networks_api)
+
+        assert excinfo.value.field == "name"
+        assert "leaked-ssid" not in str(excinfo.value)
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("name", VALID_NAMES)
+    async def test_valid_network_name_is_forwarded_unchanged(
+        self, networks_api, mock_session, name
+    ):
+        """Test a string name, even "None" or space-padded, is sent verbatim as form data."""
+        mock_session.request.return_value = create_mock_response(200, api_success_response({}))
+
+        await networks_api.set_network_name("network_123", name)
+
+        networks_api._auth_api.get_auth_token.assert_awaited_once()
+        call_args = mock_session.request.call_args
+        assert call_args.args == (
+            "PUT",
+            "https://api-user.e2ro.com/2.2/networks/network_123/settings",
+        )
+        assert call_args.kwargs["data"] == {"name": name}
+        assert "json" not in call_args.kwargs
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("enabled,wire_enabled", [(True, "true"), (False, "false")])
+    @pytest.mark.parametrize("name", VALID_NAMES)
+    async def test_valid_guest_name_is_forwarded_unchanged(
+        self, networks_api, mock_session, enabled, wire_enabled, name
+    ):
+        """Test a string guest name, even "None" or space-padded, is sent verbatim."""
+        mock_session.request.return_value = create_mock_response(200, api_success_response({}))
+
+        await networks_api.set_guest_network("network_123", enabled=enabled, name=name)
+
+        networks_api._auth_api.get_auth_token.assert_awaited_once()
+        call_args = mock_session.request.call_args
+        assert call_args.args == (
+            "PUT",
+            "https://api-user.e2ro.com/2.2/networks/network_123/guestnetwork",
+        )
+        assert call_args.kwargs["data"] == {"enabled": wire_enabled, "name": name}
+        assert "json" not in call_args.kwargs
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("enabled,wire_enabled", [(True, "true"), (False, "false")])
+    @pytest.mark.parametrize(
+        "name_kwargs",
+        [pytest.param({"name": None}, id="none"), pytest.param({}, id="omitted")],
+    )
+    async def test_guest_name_none_or_omitted_is_left_out(
+        self, networks_api, mock_session, enabled, wire_enabled, name_kwargs
+    ):
+        """Test name=None, or no name at all, still sends only the enabled field."""
+        mock_session.request.return_value = create_mock_response(200, api_success_response({}))
+
+        await networks_api.set_guest_network("network_123", enabled=enabled, **name_kwargs)
+
+        call_args = mock_session.request.call_args
+        assert call_args.args == (
+            "PUT",
+            "https://api-user.e2ro.com/2.2/networks/network_123/guestnetwork",
+        )
+        assert call_args.kwargs["data"] == {"enabled": wire_enabled}
         assert "json" not in call_args.kwargs

@@ -156,6 +156,27 @@ PASSWORD_WRITES = [
 ]
 
 
+# ==================== Name Validation Parameters ====================
+
+# Values set_guest_network must reject for a supplied name before any request.
+# None is absent: for the guest network it means "omit the name field".
+INVALID_GUEST_NAMES = [
+    pytest.param("", id="empty"),
+    pytest.param(False, id="bool"),
+    pytest.param(0, id="zero"),
+    pytest.param(123, id="number"),
+    pytest.param(b"bytes-name", id="bytes"),
+    pytest.param([], id="list"),
+    pytest.param({}, id="dict"),
+]
+
+# set_network_name requires a name, so None is invalid there as well.
+INVALID_NETWORK_NAMES = [pytest.param(None, id="none"), *INVALID_GUEST_NAMES]
+
+# Strings both name setters must forward unchanged, including the literal "None".
+VALID_NAMES = ["ordinary-name", "  preserve spaces  ", "None", "a", "Café Wi-Fi ☕"]
+
+
 # ==================== Sample Data Fixtures ====================
 
 
