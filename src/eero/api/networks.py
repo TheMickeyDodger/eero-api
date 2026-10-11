@@ -297,9 +297,14 @@ class NetworksAPI(AuthenticatedAPI):
             Raw API response: {"meta": {...}, "data": {...}}
 
         Raises:
+            EeroValidationException: If name is not a non-empty string
             EeroAuthenticationException: If not authenticated
             EeroAPIException: If the API returns an error
         """
+        # Form encoding can turn None or another non-string value into a
+        # network name the caller never intended. Reject it before any request.
+        if not isinstance(name, str) or not name:
+            raise EeroValidationException("name", "must be a non-empty string")
         auth_token = await self._auth_api.get_auth_token()
         if not auth_token:
             raise EeroAuthenticationException("Not authenticated")
@@ -456,9 +461,17 @@ class NetworksAPI(AuthenticatedAPI):
             Raw API response: {"meta": {...}, "data": {...}}
 
         Raises:
+            EeroValidationException: If name is supplied but is not a
+                non-empty string (``None`` is still accepted and omits the
+                field)
             EeroAuthenticationException: If not authenticated
             EeroAPIException: If the API returns an error
         """
+        # Form encoding can turn a non-string value into a guest network name
+        # the caller never intended. Reject it before any request; None is
+        # still accepted and omits the field below.
+        if name is not None and (not isinstance(name, str) or not name):
+            raise EeroValidationException("name", "must be a non-empty string")
         auth_token = await self._auth_api.get_auth_token()
         if not auth_token:
             raise EeroAuthenticationException("Not authenticated")
